@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o mail-gateway .
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.22
 
 # Install ca-certificates for HTTPS requests
 RUN apk --no-cache add ca-certificates
@@ -34,6 +34,12 @@ COPY --from=builder /app/mail-gateway .
 # Create non-root user
 RUN addgroup -g 1000 smtp && \
     adduser -D -u 1000 -G smtp smtp
+
+# Delivery statistics (STATS_FILE). Created here, owned by smtp, so a named
+# volume mounted on /data inherits that ownership on first use. A bind mount
+# would come up root-owned and unwritable; the gateway then keeps its
+# statistics in memory only.
+RUN mkdir /data && chown smtp:smtp /data
 
 USER smtp
 

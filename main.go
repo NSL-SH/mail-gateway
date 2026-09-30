@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -8,7 +9,13 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
+
+// DefaultStatsFile is where delivery statistics are kept (see stats.go). The
+// image creates /data owned by the unprivileged user; mount a named volume
+// there to keep them across container recreation.
+const DefaultStatsFile = "/data/stats.json"
 
 var (
 	version = "dev"
@@ -23,6 +30,27 @@ func main() {
 
 	if *versionFlag {
 		fmt.Printf("mail-gateway %s (commit: %s, built: %s)\n", version, commit, date)
+		os.Exit(0)
+	}
+
+	statsFile := os.Getenv("STATS_FILE")
+	if statsFile == "" {
+		statsFile = DefaultStatsFile
+	}
+
+	// `mail-gateway stats` prints the delivery summary as JSON and exits. It
+	// reads the file the running server writes, so it needs none of the relay
+	// configuration below: `docker exec smtp /app/mail-gateway stats`.
+	if flag.Arg(0) == "stats" {
+		sum, err := statsFromFile(statsFile, version, time.Now())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cannot read %s: %v\n", statsFile, err)
+			os.Exit(1)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		if err := enc.Encode(sum); err != nil {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -71,7 +99,12 @@ func main() {
 	log.Printf("Starting SMTP server on port %s...", smtpPort)
 	log.Printf("Relay endpoint URL: %s", relayEndpointURL)
 
-	if err := StartSMTPServer(smtpPort, relayEndpointURL, relayCredential); err != nil {
+	stats := OpenStore(statsFile)
+	if stats.Persistent() {
+		log.Printf("Delivery statistics: %s", statsFile)
+	}
+
+	if err := StartSMTPServer(smtpPort, relayEndpointURL, relayCredential, stats); err != nil {
 		log.Fatalf("❌ Failed to start SMTP server: %v", err)
 	}
 

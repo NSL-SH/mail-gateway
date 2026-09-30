@@ -44,8 +44,10 @@ type EmailRequest struct {
 
 // SMTPBackend implements SMTP server backend
 type SMTPBackend struct {
-	relayCredential        string
+	relayCredential  string
 	relayEndpointURL string
+	stats            *Store
+	client           *http.Client
 }
 
 // SMTPSession represents an SMTP session
@@ -57,11 +59,13 @@ type SMTPSession struct {
 	authUser string
 }
 
-// NewSMTPBackend creates a new SMTP backend
-func NewSMTPBackend(relayEndpointURL, relayCredential string) *SMTPBackend {
+// NewSMTPBackend creates a new SMTP backend. stats may be nil.
+func NewSMTPBackend(relayEndpointURL, relayCredential string, stats *Store) *SMTPBackend {
 	return &SMTPBackend{
 		relayEndpointURL: relayEndpointURL,
-		relayCredential:        relayCredential,
+		relayCredential:  relayCredential,
+		stats:            stats,
+		client:           &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -102,7 +106,17 @@ func (s *SMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
-// Data handles the email data and forwards to the relay API
+// Data handles the email data and forwards it to the relay API.
+//
+// The relay API takes one recipient per call, so every envelope recipient
+// (To, Cc and Bcc alike — SMTP does not distinguish them) gets its own copy,
+// addressed to them alone. If any copy fails the whole transaction is reported
+// as failed, so an app that retries may deliver a second copy to the
+// recipients that did succeed. Status codes:
+//   - 250 when every copy was accepted (including "skipped" by a relay with no
+//     delivery provider — the relay said OK, the stats record the difference);
+//   - 451 (temporary) when a copy was rate-limited or the relay was unreachable;
+//   - 554 (permanent) when the relay refused a copy.
 func (s *SMTPSession) Data(r io.Reader) error {
 	// Read email data
 	data, err := io.ReadAll(io.LimitReader(r, MaxEmailSize))
@@ -110,14 +124,13 @@ func (s *SMTPSession) Data(r io.Reader) error {
 		return err
 	}
 
-	// Parse email (now includes attachments)
-	subject, text, html, attachments := parseEmail(string(data))
-
-	// Get first recipient
-	if len(s.to) == 0 {
+	recipients := dedupeRecipients(s.to)
+	if len(recipients) == 0 {
 		return fmt.Errorf("no recipients specified")
 	}
-	recipientEmail := s.to[0]
+
+	// Parse email (now includes attachments)
+	subject, text, html, attachments := parseEmail(string(data))
 
 	// Determine app name from sender address, fall back to auth username
 	var appName string
@@ -134,17 +147,75 @@ func (s *SMTPSession) Data(r io.Reader) error {
 		appName = "app"
 	}
 
-	log.Printf("Processing email from app '%s' to %s (attachments: %d)", appName, recipientEmail, len(attachments))
+	log.Printf("Processing email from app '%s' to %d recipient(s) (attachments: %d)", appName, len(recipients), len(attachments))
 
-	// Forward to relay email API
-	err = s.forwardToAPI(recipientEmail, subject, text, html, appName, attachments)
-	if err != nil {
-		log.Printf("Failed to forward email to API: %v", err)
-		return err
+	var temporary, permanent []string
+	for _, to := range recipients {
+		res, err := s.backend.forwardToAPI(EmailRequest{
+			To:          to,
+			Subject:     subject,
+			Text:        text,
+			HTML:        html,
+			AppName:     appName,
+			Attachments: attachments,
+		})
+		ev := Event{App: appName, From: res.From, To: to, Status: StatusSent}
+		switch {
+		case err == nil && res.Skipped:
+			ev.Status = StatusSkipped
+			log.Printf("Relay accepted email for %s but skipped delivery (no delivery provider configured)", to)
+		case err == nil:
+			log.Printf("Email forwarded successfully from %s to %s", appName, to)
+		default:
+			ev.Error = err.Error()
+			var re *RelayError
+			if errors.As(err, &re) && re.StatusCode == http.StatusTooManyRequests {
+				ev.Status = StatusRateLimited
+				temporary = append(temporary, to)
+			} else if errors.As(err, &re) {
+				ev.Status = StatusFailed
+				permanent = append(permanent, to)
+			} else {
+				// No HTTP answer at all: the relay is unreachable, worth a retry.
+				ev.Status = StatusFailed
+				temporary = append(temporary, to)
+			}
+			log.Printf("Failed to forward email for %s to API: %v", to, err)
+		}
+		s.backend.stats.Record(ev)
 	}
 
-	log.Printf("Email forwarded successfully from %s", appName)
+	switch {
+	case len(permanent) > 0:
+		return &smtp.SMTPError{
+			Code:         554,
+			EnhancedCode: smtp.EnhancedCode{5, 0, 0},
+			Message:      fmt.Sprintf("relay refused %d of %d recipient(s)", len(permanent), len(recipients)),
+		}
+	case len(temporary) > 0:
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+			Message:      fmt.Sprintf("relay rate limit reached or relay unreachable for %d of %d recipient(s), try again later", len(temporary), len(recipients)),
+		}
+	}
 	return nil
+}
+
+// dedupeRecipients strips angle brackets and drops repeats (case-insensitive).
+func dedupeRecipients(to []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range to {
+		r = strings.TrimSpace(strings.Trim(strings.TrimSpace(r), "<>"))
+		k := strings.ToLower(r)
+		if r == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, r)
+	}
+	return out
 }
 
 // Reset resets the session
@@ -158,53 +229,57 @@ func (s *SMTPSession) Logout() error {
 	return nil
 }
 
-// forwardToAPI sends the email to the relay email API via HTTP
-func (s *SMTPSession) forwardToAPI(recipientEmail, subject, text, html, appName string, attachments []EmailAttachment) error {
-	// Create email request
-	emailReq := EmailRequest{
-		To:          recipientEmail,
-		Subject:     subject,
-		Text:        text,
-		HTML:        html,
-		AppName:     appName,
-		Attachments: attachments,
-	}
+// RelayError is a non-2xx answer from the relay API.
+type RelayError struct {
+	StatusCode int
+	Body       string
+}
 
-	// Marshal to JSON
+func (e *RelayError) Error() string {
+	return fmt.Sprintf("API returned error status %d: %s", e.StatusCode, strings.TrimSpace(e.Body))
+}
+
+// relayResult is the relay's success body: {success, from, skipped}. From is
+// the sender the relay enforced; Skipped means it accepted the email but has no
+// delivery provider configured, so nothing was sent.
+type relayResult struct {
+	Success bool   `json:"success"`
+	From    string `json:"from"`
+	Skipped bool   `json:"skipped"`
+}
+
+// forwardToAPI sends one email to the relay email API. A non-2xx answer is a
+// *RelayError; any other error means the relay never answered.
+func (b *SMTPBackend) forwardToAPI(emailReq EmailRequest) (relayResult, error) {
+	var res relayResult
+
 	jsonData, err := json.Marshal(emailReq)
 	if err != nil {
-		return fmt.Errorf("failed to marshal email request: %w", err)
+		return res, fmt.Errorf("failed to marshal email request: %w", err)
 	}
 
-	// Create HTTP request
-	url := fmt.Sprintf("%s/email/send", s.backend.relayEndpointURL)
+	url := fmt.Sprintf("%s/email/send", b.relayEndpointURL)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		return res, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
-
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", s.backend.relayCredential))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", b.relayCredential))
 
-	// Send request
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	resp, err := client.Do(req)
+	resp, err := b.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send HTTP request: %w", err)
+		return res, fmt.Errorf("failed to send HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check response
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API returned error status %d: %s", resp.StatusCode, string(body))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return res, &RelayError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
-
-	log.Printf("Email successfully forwarded to API for recipient %s", recipientEmail)
-	return nil
+	// An older relay may answer with no body or a different one: that is still
+	// a success, just without the enforced sender or the skipped flag.
+	_ = json.Unmarshal(body, &res)
+	return res, nil
 }
 
 // sanitizeAppName sanitizes the app name
@@ -335,7 +410,7 @@ func extractBodyParts(entity *message.Entity) (text, html string, attachments []
 }
 
 // StartSMTPServer starts the SMTP server
-func StartSMTPServer(port, relayEndpointURL, relayCredential string) error {
+func StartSMTPServer(port, relayEndpointURL, relayCredential string, stats *Store) error {
 	if port == "" {
 		return errors.New("SMTP port is required")
 	}
@@ -348,7 +423,7 @@ func StartSMTPServer(port, relayEndpointURL, relayCredential string) error {
 		return errors.New("relay credential is required")
 	}
 
-	backend := NewSMTPBackend(relayEndpointURL, relayCredential)
+	backend := NewSMTPBackend(relayEndpointURL, relayCredential, stats)
 
 	server := smtp.NewServer(backend)
 	server.Addr = ":" + port
