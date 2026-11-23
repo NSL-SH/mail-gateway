@@ -1,4 +1,4 @@
-module github.com/Yundera/mail-gateway
+module github.com/nsl-sh/mail-gateway
 
 go 1.21
 
